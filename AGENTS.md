@@ -2,6 +2,14 @@
 
 DeepSeek Harness is an all-plugin Cordis agent harness. Read [docs/architecture.md](docs/architecture.md) before changing `packages/`; follow [docs/AGENTS.md](docs/AGENTS.md) for documentation.
 
+## Working agreement
+
+Commit and push every code or documentation change in the same session that produces it; an unpushed change is unfinished. Follow the [pre-push checks](.agents/skills/dsh-pre-push-checks/SKILL.md).
+
+Never commit sensitive information; credentials stay in the environment or an untracked `.env`.
+
+Fix a detected defect immediately, at any stage, without asking permission.
+
 ## Pre-stable APIs and released Session data
 
 Public APIs are pre-stable; update every consumer. Follow [version/status](docs/session-format-status.md) and [type acknowledgements](docs/cookbook/reviewing-persistence-type-changes.md). [Adjacent migration](.agents/notes/implemented/architecture/2026-08-31-released-session-format-migrations.md) may add a version-named successor but never move, overwrite, or delete committed generations; predecessors imply neither fallback nor downgrade support. SQLite uses monotonic `SCHEMA_VERSION`.
