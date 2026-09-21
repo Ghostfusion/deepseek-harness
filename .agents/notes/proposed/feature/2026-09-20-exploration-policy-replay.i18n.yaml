@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/proposed/feature/2026-09-20-exploration-policy-replay.md
-2026-09-20-exploration-policy-replay.md: 4607c49e9e33a4778a5b83bb8a2182c05c0fbcac
-2026-09-20-exploration-policy-replay.zh.md: da137fb5bd2720d2ab657a9677e8b6e980d48a16
+2026-09-20-exploration-policy-replay.md: 0bffd92f094dfbe2114c5953ce464e54d4feb2c9
+2026-09-20-exploration-policy-replay.zh.md: c79132b76495c7e5d0daf48deffa9869a4d94636

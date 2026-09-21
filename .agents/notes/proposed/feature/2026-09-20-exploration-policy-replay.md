@@ -52,11 +52,13 @@ A policy is code, not configuration: given the prefix it has observed, it return
 
 Two properties are contractual rather than advisory. First, **prefix-only**: a policy may read only nodes already revealed, the baseline score, and structural metadata; unrevealed scores, known-optimal node ids, and absolute score targets are out of reach by construction, because replay only hands it revealed observations. Second, **monotone selection**: the deployed policy is itself a candidate in every improvement round, and the next deployed policy is the argmax over all evaluated revisions, so a revision is never adopted on evidence that scores worse than what it replaces.
 
-A policy also plans the shape of the next run (`plan_grid` in the paper's contract): how many branches to open and how deep to refine each. In this harness that plan is what bounds a rollout's width and depth, replacing today's fixed `maxParallelToolCalls` and round caps for runs that opt in.
+A policy also plans the shape of the next run (`plan_grid` in the paper's contract): how many branches to open and how deep to refine each. In this harness that plan is what bounds a rollout's width and depth, replacing today's fixed `maxParallelToolCalls` for runs that opt in. It replaces nothing else: `maxGoalRounds` stays the session's outer round ceiling, a plan's `rounds` is validated against it, and a plan that exceeds it fails loud rather than bypassing the bound or silently clipping it — the same resolution this document gives every other deployment ceiling.
 
 ### D. Policy-improvement loop
 
 An outer loop runs the current policy online, appends the completed tree to a history of recorded trees, then asks a policy-development agent to revise the policy code and scores every revision by replay over the whole history. The revision loop composes existing pieces: the development agent is a `subagent` or a `workflow` script, the candidate policy is evaluated in the sandbox that already exists for model-written plugins (`evaluateHostCode` in `packages/extensions/cordis-host-runner/src/sandbox.ts`), and redeployment uses the existing plugin lifecycle (`packages/boot/plugin-manager`) or a runtime-mutable settings section, as `maxParallelToolCalls` already is.
+
+The pool the loop scores against is bounded, and the two retention knobs bound different things. Tree skeletons — node identity, parentage, outcome, score, round counts — are log-derived and small, and `workspaceRetention` never prunes them; what it prunes is the content-addressed capture artifacts, the disk-heavy part, per node. A tree whose artifacts were pruned is no longer replayable, so it leaves the simulator pool and is counted as excluded rather than disappearing quietly, and the loop records the pool size and the excluded count beside every score it produces. `poolDepth`, a separate improvement-loop knob, bounds how many completed trees stay replayable at once. The pool therefore shrinks only by explicit retention, never as a side effect of a per-run storage setting, and a shrinking pool is visible in the scored record.
 
 Redeployment is the one step that must not be automatic in a shipped profile: a rewritten policy is model-authored code, so it lands as a candidate a human or an existing review flow approves, not as an auto-installed plugin.
 
@@ -71,9 +73,11 @@ Redeployment is the one step that must not be automatic in a shipped profile: a 
 | Replay | Traversal of recorded children only: no model call, no tool execution, deterministic |
 | Replay objective | Quality minus priced work, plus a batching bonus |
 | Policy improvement | A development agent rewrites the policy code; every revision is scored by replay |
-| Simulator pool | Every recorded tree from every previous round, all used to score each revision |
+| Simulator pool | Every recorded tree from every previous round that is still replayable, all used to score each revision; pruned artifacts remove a tree from the pool and the exclusion is counted |
 
 ## Data model
+
+A node is one attempt — one subagent run or one refinement round. The alternative considered and rejected on the evidence available today is a whole session as the node: that makes replay nearly free to build and nearly useless, because the decisions a policy must make live inside a session rather than between sessions. The choice is provisional and phase 1's own measurements validate it (see Phasing); every field below is written for it, and changing it changes the event shape rather than the scorer's contract.
 
 | Field | Source | Meaning |
 |---|---|---|
@@ -108,6 +112,16 @@ Redeployment is the one step that must not be automatic in a shipped profile: a 
 
 This harness has no grader, judge, rubric, or quality metric of any kind; `benchmarks/` measures milliseconds and memory and is explicitly forbidden from consuming recorded sessions. The proposal therefore treats the score as an input the task owns, delivered through a declared evaluator seam, and keeps every quality metric out of the harness core. Inventing a proxy score inside the harness would optimize the proxy, and a self-improving loop makes that failure permanent rather than transient.
 
+## Choosing `beta1` and `beta2`
+
+The objective is imported from the paper, and it is the one knob that decides what "better" means, so its defaults carry a stated story instead of a bare number. Quality is normalized against the best recorded score in the pool when the components are combined, which turns `V` into "fraction of the best known outcome, minus priced work, plus a batching bonus"; the scorer still reports the raw components, so a task that knows its quality scale can price `beta1` against that scale directly.
+
+The shipped defaults are `beta1 = 0.01` and `beta2 = 0.005`: a hundred revealed attempts cost as much as reaching the best known outcome, and batching can offset at most half the priced work. `beta2` must stay below `beta1` — at or above it the cost term is net-positive and the argmax is whatever reveals the most nodes regardless of quality, the opposite of the intent — so config validation rejects `beta2 >= beta1` rather than documenting it.
+
+The other degenerate shapes are named so a sweep can recognize them. `beta1 = 0` makes revealing everything free, so the argmax collapses to maximum quality with no efficiency claim. `beta1` large relative to the spread of recorded scores makes the shortest rollout win, and since the deployed policy is itself a candidate, "change nothing" then wins every round forever.
+
+Two rules keep those shapes visible rather than silent. A sweep reports the argmax at each `beta`, so a decision that exists at only one `beta` is visible as such. And a revision whose revealed tree is empty is invalid rather than selected: monotone selection compares scored revisions, and a policy that reveals nothing has not scored anything.
+
 ## Configuration surface
 
 | Knob | Owner | Purpose |
@@ -117,17 +131,18 @@ This harness has no grader, judge, rubric, or quality metric of any kind; `bench
 | `maxParallelism` | Policy plan, bounded by config | Workers per decision round |
 | `branchCount`, `refineCount` | Policy plan, bounded by config | Width and depth of the next run |
 | `rounds`, `revisions` | Improvement-loop config | Outer iterations and policy revisions per iteration |
-| `workspaceRetention` | Storage config | How many node captures a run keeps |
+| `workspaceRetention` | Storage config | How many nodes' capture artifacts a run keeps; pruning drops artifacts, never tree structure or scores |
+| `poolDepth` | Improvement-loop config | How many completed trees stay replayable in the simulator pool |
 
 Every knob is a validated `Config` field changeable from `cordis.yml`, per the no-hardcoded-tunables rule; the deployment ceiling stays fixed and a plan that exceeds it fails loud rather than silently clipping.
 
 ## Phasing
 
-1. **Score and tree** — one long-horizon workload records attempt nodes with a task-supplied score, restorable after restart.
+1. **Score and tree** — one long-horizon workload records attempt nodes with a task-supplied score, restorable after restart. This phase also settles node granularity provisionally (see Data model): it reports per-attempt capture cost and the breadth of the recorded tree, and the choice is revisited if those measurements contradict it.
 2. **Replay scorer** — the recorded tree is scored offline; the deployed policy's own replay reproduces its recorded trajectory.
-3. **Offline comparison** — the fixed strategy is compared against variants with no policy seam and no rewrite loop, which already answers whether a cheaper batching rule existed.
+3. **Offline comparison** — the fixed strategy is compared against variants with no policy seam and no rewrite loop, which already answers whether a cheaper batching rule existed. A negative answer is a legitimate end of the effort: the project stops with a measured, simulated comparison and no deployable win, and phase 4 is not entered.
 4. **Policy seam** — batching, width, depth, and stopping become programmable behind one Service Definition.
-5. **Improvement loop** — revisions are generated, scored by replay, and redeployed under review.
+5. **Improvement loop** — revisions are generated, scored by replay, and redeployed under review, with each redeployment gated on the live-versus-replay divergence check.
 
 ## Alternatives considered
 
@@ -164,13 +179,15 @@ Model-claimed tasks in `packages/experimental/agent-team` are chosen by the mode
 - A policy cannot read an unrevealed score, a hardcoded winning node id, or an absolute score target; the constraint is enforced by what replay exposes, not by review alone.
 - Every new knob is a validated `Config` field changeable from `cordis.yml`; no `DEFAULT_*` constant substitutes for configurability.
 - A rewritten policy reaches a shipped profile only through an explicit review step, never as an automatic install.
+- A redeployed policy's first live rounds are compared against the trajectory its own replay predicted; divergence beyond a configured tolerance flags the round and pauses redeployment, and the reviewing human sees that divergence report rather than only the code diff.
+- Every recorded score states the simulator pool it was computed over, including how many recorded trees were excluded because they are no longer replayable.
 - Documentation, bilingual pairs, and the recorded-session snapshots required by the testing policy land in the same change.
 
 ## Risks
 
 - **No score exists yet.** The whole mechanism is blocked on a task-owned quality signal. If the project invents a convenient proxy inside the harness, a self-improving loop will optimize the proxy and lock that in.
-- **Node granularity is unresolved.** The paper's node is one cheap generation-and-evaluation; a session here is expensive and long. Choosing sessions as nodes makes replay cheap to build and nearly useless; choosing attempts makes it useful and requires per-attempt workspace capture.
-- **Workspace capture costs disk.** One capture per attempt, content-addressed, with a retention policy, is new storage growth the harness does not have today.
+- **Node granularity is provisional.** The paper's node is one cheap generation-and-evaluation; a session here is expensive and long. This document records one attempt per node, because session-granularity nodes make replay cheap to build and nearly useless while attempt-granularity nodes are useful and require per-attempt workspace capture; phase 1 reports per-attempt capture cost and tree breadth to confirm or refute that, and the fallback is a coarser unit — one decision round rather than one attempt — at the cost of replay resolution.
+- **Workspace capture costs disk.** One capture per attempt, content-addressed, is new storage growth the harness does not have today; retention prunes those artifacts only, and the tree skeleton and scores survive pruning (see D).
 - **Realized trees are narrow.** Fan-out caps of 8 subagents and 10 parallel tool calls bound how much of the search space any recorded tree covers; widening them changes product behaviour and is not part of this proposal.
 - **Monotone replay is not monotone live.** The guarantee is over fixed history only, so a selected revision can still regress a live run.
 - **Model-written policy code is a security surface.** Executing and installing rewritten policy code needs the existing sandbox and an explicit review gate; auto-install into a shipped profile is out of scope.
@@ -178,9 +195,9 @@ Model-claimed tasks in `packages/experimental/agent-team` are chosen by the mode
 
 ## Open questions
 
-- Is a node an attempt, a turn, a step, or a whole session, and does the answer differ between the ralph-style loop and subagent fan-out?
+- Does phase 1 confirm one attempt per node, and if per-attempt capture cost is unaffordable, how much replay resolution does the coarser decision-round fallback lose?
 - Who declares the score: a task configuration, a tool the model calls, or an evaluator plugin the deployment mounts?
 - Should the policy decide batching only across attempts, or also across tool calls inside one step, where `executeToolCalls` already runs a bounded pool?
 - Do retry settlements (`assistant/attempt`, `llm/retry`) become nodes, or stay attributed to the attempt that contains them?
 - Does the first implementation live in `packages/experimental/` until the seam is proven, and which shipped profile is the first to opt in?
-- How does a policy's `plan_grid` interact with an existing goal's `maxGoalRounds`, which today is the only round bound a session has?
+- Should `maxGoalRounds` be exposed to the policy as part of its observed prefix, so a plan can size itself to the remaining budget?
